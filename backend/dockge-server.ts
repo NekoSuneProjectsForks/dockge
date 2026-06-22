@@ -215,6 +215,13 @@ export class DockgeServer {
         // Create Socket.io
         this.io = new socketIO.Server(this.httpServer, {
             cors,
+            // Allow large payloads so node-to-node stack transfers (a zip sent
+            // as base64 over the socket) don't blow past the 1MB default and
+            // get the connection dropped mid-transfer. Configurable via env.
+            maxHttpBufferSize: Number(process.env.DOCKGE_MAX_TRANSFER_MB || 1024) * 1024 * 1024,
+            // Be tolerant of slow/large transfers before considering the
+            // connection dead (default is 20s).
+            pingTimeout: Number(process.env.DOCKGE_PING_TIMEOUT_MS || 300000),
             allowRequest: (req, callback) => {
                 let isOriginValid = true;
                 const bypass = isDev || process.env.UPTIME_KUMA_WS_ORIGIN_CHECK === "bypass";

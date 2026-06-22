@@ -187,10 +187,19 @@ export class DockerSocketHandler extends AgentSocketHandler {
                 server.sendStackList();
 
                 if (Boolean(deploy)) {
-                    const stack = await Stack.getStack(server, stackName);
-                    await stack.deploy(socket);
-                    server.sendStackList();
-                    stack.joinCombinedTerminal(socket);
+                    try {
+                        const stack = await Stack.getStack(server, stackName);
+                        await stack.deploy(socket);
+                        server.sendStackList();
+                        stack.joinCombinedTerminal(socket);
+                    } catch (deployError) {
+                        // Roll back the freshly imported files so a failed
+                        // transfer doesn't leave a duplicate copy on this node.
+                        // The source stack is kept whenever the import fails.
+                        await fsAsync.rm(root, { recursive: true, force: true });
+                        server.sendStackList();
+                        throw deployError;
+                    }
                 }
 
                 callbackResult({
