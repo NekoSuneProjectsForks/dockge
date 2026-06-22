@@ -253,12 +253,12 @@
             </BModal>
 
             <!-- Transfer Dialog -->
-            <BModal v-model="showTransferDialog" :cancelTitle="$t('cancel')" :okTitle="$t('transferStack', 'Transfer')" okVariant="primary" :okDisabled="!transferTarget || transferring" @ok.prevent="confirmTransfer">
+            <BModal v-model="showTransferDialog" :cancelTitle="$t('cancel')" :okTitle="$t('transferStack', 'Transfer')" okVariant="primary" :okDisabled="transferTarget === null || transferring" @ok.prevent="confirmTransfer">
                 <p>{{ $t("transferStackMsg", "Zip this stack, send it to another node, unzip and deploy it there. The stack will be moved (stopped and removed from this node after a successful deploy on the target).") }}</p>
 
                 <label class="form-label">{{ $t("targetNode", "Target Node") }}</label>
                 <select v-model="transferTarget" class="form-select">
-                    <option value="" disabled>{{ $t("selectNode", "Select a node...") }}</option>
+                    <option :value="null" disabled>{{ $t("selectNode", "Select a node...") }}</option>
                     <option v-for="endpoint in transferTargets" :key="endpoint" :value="endpoint">
                         {{ $root.endpointDisplayFunction(endpoint) }}
                     </option>
@@ -369,7 +369,7 @@ export default {
             submitted: false,
             showDeleteDialog: false,
             showTransferDialog: false,
-            transferTarget: "",
+            transferTarget: null,
             transferring: false,
             transferStatus: "",
             newContainerName: "",
@@ -383,12 +383,17 @@ export default {
 
         /**
          * Other connected (online) nodes this stack can be transferred to.
-         * Excludes the node the stack currently lives on.
-         * @returns {string[]} List of target endpoints
+         * Only real agents addressed by ip:port are offered - the empty ""
+         * endpoint (the local/main node) is excluded so transfers always go to
+         * an already-connected node, never the null/local endpoint.
+         * Also excludes the node the stack currently lives on.
+         * @returns {string[]} List of target endpoints (ip:port)
          */
         transferTargets() {
             return Object.keys(this.$root.agentList)
-                .filter(endpoint => endpoint !== this.endpoint && this.$root.agentStatusList[endpoint] === "online");
+                .filter(endpoint => endpoint !== ""
+                    && endpoint !== this.endpoint
+                    && this.$root.agentStatusList[endpoint] === "online");
         },
 
         urls() {
@@ -743,7 +748,9 @@ export default {
         },
 
         openTransferDialog() {
-            this.transferTarget = this.transferTargets[0] || "";
+            // Note: the local/current node's endpoint is "" (empty string), so
+            // use null - not a falsy check - to represent "nothing selected".
+            this.transferTarget = this.transferTargets.length > 0 ? this.transferTargets[0] : null;
             this.transferStatus = "";
             this.showTransferDialog = true;
         },
@@ -760,7 +767,8 @@ export default {
             const stackName = this.stack.name;
             const source = this.endpoint;
 
-            if (!target) {
+            // target can legitimately be "" (the local node), so compare to null.
+            if (target === null) {
                 return;
             }
 
