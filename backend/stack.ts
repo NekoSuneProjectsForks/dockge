@@ -396,6 +396,13 @@ export class Stack {
     }
 
     static async getStack(server: DockgeServer, stackName: string, skipFSOperations = false) : Promise<Stack> {
+        // Reject names containing path separators or "..". Without this an
+        // admin (whose requireStackAccess check is a no-op) could pass a name
+        // like "../../etc" and have file operations escape the stacks dir.
+        if (!stackName.match(/^[a-z0-9_-]+$/)) {
+            throw new ValidationError("Stack name can only contain [a-z][0-9] _ - only");
+        }
+
         let dir = path.join(server.stacksDir, stackName);
 
         if (!skipFSOperations) {
@@ -513,7 +520,27 @@ export class Stack {
         if (exitCode !== 0) {
             throw new Error("Failed to restart, please check the terminal output for more information.");
         }
+
+        // After a successful pull + up, the previous image becomes dangling
+        // (untagged). Remove those leftovers so old versions don't pile up.
+        await this.pruneDanglingImages();
+
         return exitCode;
+    }
+
+    /**
+     * Remove dangling (untagged) images left behind after pulling a newer
+     * version of an image. This only removes images that are no longer
+     * referenced by any tag or container, so running stacks are never affected.
+     */
+    async pruneDanglingImages() {
+        try {
+            await spawnDocker(this.server, [ "image", "prune", "-f" ], undefined, {
+                encoding: "utf-8",
+            });
+        } catch (e) {
+            log.warn("pruneDanglingImages", `Failed to prune dangling images: ${e instanceof Error ? e.message : "unknown error"}`);
+        }
     }
 
     async updateForBulk(forceRestart = false): Promise<BulkUpdateResult> {
@@ -537,6 +564,11 @@ export class Stack {
                     encoding: "utf-8",
                 });
                 restarted = true;
+
+                // Clean up the now-dangling old image left over by the pull.
+                if (updatesFound) {
+                    await this.pruneDanglingImages();
+                }
             } else {
                 skippedRestart = true;
             }
@@ -595,6 +627,7 @@ export class Stack {
 
     async joinCombinedTerminal(socket: DockgeSocket) {
         const terminalName = getCombinedTerminalName(socket.endpoint, this.name);
+        Terminal.setStackOwner(terminalName, this.name);
         const command = await buildDockerCommand(this.server, this.getComposeOptions("logs", "-f", "--tail", "100"), this.fullPath);
         const terminal = Terminal.getOrCreateTerminal(this.server, terminalName, command.file, command.args, command.cwd || this.fullPath);
         terminal.enableKeepAlive = true;
@@ -614,6 +647,7 @@ export class Stack {
 
     async joinContainerTerminal(socket: DockgeSocket, serviceName: string, shell : string = "sh", index: number = 0) {
         const terminalName = getContainerExecTerminalName(socket.endpoint, this.name, serviceName, index);
+        Terminal.setStackOwner(terminalName, this.name);
         let terminal = Terminal.getTerminal(terminalName);
 
         if (!terminal) {

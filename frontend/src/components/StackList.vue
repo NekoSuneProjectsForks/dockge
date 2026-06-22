@@ -21,6 +21,17 @@
                 </div>
             </div>
 
+            <!-- Node / Agent filter -->
+            <div v-if="$root.agentCount > 1" class="header-filter node-filter px-2 pt-2">
+                <font-awesome-icon icon="server" class="me-2 text-muted" />
+                <select v-model="selectedNode" class="form-select form-select-sm node-select">
+                    <option value="all">{{ $t("All Nodes", "All Nodes") }} ({{ Object.keys($root.completeStackList).length }})</option>
+                    <option v-for="(agent, nodeEndpoint) in $root.agentList" :key="nodeEndpoint" :value="nodeEndpoint">
+                        {{ statusIcon(nodeEndpoint) }} {{ $root.endpointDisplayFunction(nodeEndpoint) }} ({{ nodeStackCount(nodeEndpoint) }})
+                    </option>
+                </select>
+            </div>
+
             <!-- TODO -->
             <div v-if="false" class="header-filter">
                 <!--<StackListFilter :filterState="filterState" @update-filter="updateFilter" />-->
@@ -83,6 +94,7 @@ export default {
     data() {
         return {
             searchText: "",
+            selectedNode: "all",
             selectMode: false,
             selectAll: false,
             disableSelectAllWatcher: false,
@@ -148,7 +160,13 @@ export default {
                         .length > 0;
                 }
 
-                return searchTextMatch && activeMatch && tagsMatch;
+                // filter by selected node / agent endpoint
+                let nodeMatch = true;
+                if (this.selectedNode !== "all") {
+                    nodeMatch = (stack.endpoint || "") === this.selectedNode;
+                }
+
+                return searchTextMatch && activeMatch && tagsMatch && nodeMatch;
             });
 
             result.sort((m1, m2) => {
@@ -200,6 +218,11 @@ export default {
 
             if (this.selectMode) {
                 listHeaderHeight += 42;
+            }
+
+            // Account for the node/agent filter row shown with multiple nodes
+            if (this.$root.agentCount > 1) {
+                listHeaderHeight += 46;
             }
 
             return {
@@ -276,6 +299,30 @@ export default {
          */
         clearSearchText() {
             this.searchText = "";
+        },
+        /**
+         * Count the stacks that belong to a given node endpoint.
+         * @param {string} endpoint Agent endpoint ("" for the local node)
+         * @returns {number} Number of stacks on that node
+         */
+        nodeStackCount(endpoint) {
+            return Object.values(this.$root.completeStackList)
+                .filter(stack => (stack.endpoint || "") === endpoint)
+                .length;
+        },
+        /**
+         * Small status indicator for a node in the dropdown.
+         * @param {string} endpoint Agent endpoint
+         * @returns {string} Icon representing the node status
+         */
+        statusIcon(endpoint) {
+            const status = this.$root.agentStatusList[endpoint];
+            if (status === "online") {
+                return "🟢";
+            } else if (status === "connecting") {
+                return "🟡";
+            }
+            return "🔴";
         },
         /**
          * Update the StackList Filter
@@ -386,6 +433,18 @@ export default {
 .header-filter {
     display: flex;
     align-items: center;
+}
+
+.node-filter {
+    .node-select {
+        max-width: 100%;
+    }
+
+    .dark & .node-select {
+        background-color: $dark-bg2;
+        color: $dark-font-color;
+        border-color: $dark-border-color;
+    }
 }
 
 @media (max-width: 770px) {

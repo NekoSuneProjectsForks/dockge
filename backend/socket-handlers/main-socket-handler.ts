@@ -152,7 +152,10 @@ export class MainSocketHandler extends SocketHandler {
             const user = await this.login(data.username, data.password);
 
             if (user) {
-                if (user.twofa_status === 0) {
+                // Use an else-if chain so a stray `token` sent with a normal
+                // (non-2FA) login can never reach the 2FA branch below, and so
+                // only ONE callback is ever invoked per login.
+                if (user.twofa_status !== 1) {
                     server.afterLogin(socket, user);
 
                     log.info("auth", `Successfully logged in user ${data.username}. IP=${clientIP}`);
@@ -161,45 +164,25 @@ export class MainSocketHandler extends SocketHandler {
                         ok: true,
                         token: User.createJWT(user, server.jwtSecret),
                     });
-                }
-
-                if (user.twofa_status === 1 && !data.token) {
+                } else if (!data.token) {
 
                     log.info("auth", `2FA token required for user ${data.username}. IP=${clientIP}`);
 
                     callback({
                         tokenRequired: true,
                     });
-                }
+                } else {
+                    // 2FA verification is not implemented in this build (no TOTP
+                    // library and no enrollment flow). Fail closed rather than
+                    // crash with a ReferenceError on an undefined `notp`. If a
+                    // 2FA-enabled account exists it must be reset via the CLI.
+                    log.warn("auth", `2FA login attempted but 2FA verification is not available. user=${data.username} IP=${clientIP}`);
 
-                if (data.token) {
-                    // @ts-ignore
-                    const verify = notp.totp.verify(data.token, user.twofa_secret, twoFAVerifyOptions);
-
-                    if (user.twofa_last_token !== data.token && verify) {
-                        server.afterLogin(socket, user);
-
-                        await R.exec("UPDATE `user` SET twofa_last_token = ? WHERE id = ? ", [
-                            data.token,
-                            socket.userID,
-                        ]);
-
-                        log.info("auth", `Successfully logged in user ${data.username}. IP=${clientIP}`);
-
-                        callback({
-                            ok: true,
-                            token: User.createJWT(user, server.jwtSecret),
-                        });
-                    } else {
-
-                        log.warn("auth", `Invalid token provided for user ${data.username}. IP=${clientIP}`);
-
-                        callback({
-                            ok: false,
-                            msg: "authInvalidToken",
-                            msgi18n: true,
-                        });
-                    }
+                    callback({
+                        ok: false,
+                        msg: "authInvalidToken",
+                        msgi18n: true,
+                    });
                 }
             } else {
 

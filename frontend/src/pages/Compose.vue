@@ -60,6 +60,12 @@
                 </button>
 
                 <button v-if="isEditMode && !isAdd" class="btn btn-normal" :disabled="processing" @click="discardStack">{{ $t("discardStack") }}</button>
+
+                <button v-if="!isEditMode && $root.isAdmin && transferTargets.length > 0" class="btn btn-normal" :disabled="processing || transferring" @click="openTransferDialog">
+                    <font-awesome-icon icon="right-left" class="me-1" />
+                    {{ $t("transferStack", "Transfer to Node") }}
+                </button>
+
                 <button v-if="!isEditMode" class="btn btn-danger" :disabled="processing" @click="showDeleteDialog = !showDeleteDialog">
                     <font-awesome-icon icon="trash" class="me-1" />
                     {{ $t("deleteStack") }}
@@ -79,6 +85,7 @@
                     v-show="showProgressTerminal"
                     ref="progressTerminal"
                     class="mb-3 terminal"
+                    mode="progress"
                     :name="terminalName"
                     :endpoint="endpoint"
                     :rows="progressTerminalRows"
@@ -244,6 +251,24 @@
             <BModal v-model="showDeleteDialog" :cancelTitle="$t('cancel')" :okTitle="$t('deleteStack')" okVariant="danger" @ok="deleteDialog">
                 {{ $t("deleteStackMsg") }}
             </BModal>
+
+            <!-- Transfer Dialog -->
+            <BModal v-model="showTransferDialog" :cancelTitle="$t('cancel')" :okTitle="$t('transferStack', 'Transfer')" okVariant="primary" :okDisabled="!transferTarget || transferring" @ok.prevent="confirmTransfer">
+                <p>{{ $t("transferStackMsg", "Zip this stack, send it to another node, unzip and deploy it there. The stack will be moved (stopped and removed from this node after a successful deploy on the target).") }}</p>
+
+                <label class="form-label">{{ $t("targetNode", "Target Node") }}</label>
+                <select v-model="transferTarget" class="form-select">
+                    <option value="" disabled>{{ $t("selectNode", "Select a node...") }}</option>
+                    <option v-for="endpoint in transferTargets" :key="endpoint" :value="endpoint">
+                        {{ $root.endpointDisplayFunction(endpoint) }}
+                    </option>
+                </select>
+
+                <div v-if="transferring" class="mt-3 text-muted">
+                    <font-awesome-icon icon="spinner" spin class="me-1" />
+                    {{ transferStatus }}
+                </div>
+            </BModal>
         </div>
     </transition>
 </template>
@@ -343,6 +368,10 @@ export default {
             isEditMode: false,
             submitted: false,
             showDeleteDialog: false,
+            showTransferDialog: false,
+            transferTarget: "",
+            transferring: false,
+            transferStatus: "",
             newContainerName: "",
             stopServiceStatusTimeout: false,
         };
@@ -350,6 +379,16 @@ export default {
     computed: {
         endpointDisplay() {
             return this.$root.endpointDisplayFunction(this.endpoint);
+        },
+
+        /**
+         * Other connected (online) nodes this stack can be transferred to.
+         * Excludes the node the stack currently lives on.
+         * @returns {string[]} List of target endpoints
+         */
+        transferTargets() {
+            return Object.keys(this.$root.agentList)
+                .filter(endpoint => endpoint !== this.endpoint && this.$root.agentStatusList[endpoint] === "online");
         },
 
         urls() {
@@ -700,6 +739,69 @@ export default {
                 if (res.ok) {
                     this.$router.push("/");
                 }
+            });
+        },
+
+        openTransferDialog() {
+            this.transferTarget = this.transferTargets[0] || "";
+            this.transferStatus = "";
+            this.showTransferDialog = true;
+        },
+
+        /**
+         * Move this stack to another node:
+         *   1. Export (zip) the stack folder from the source node.
+         *   2. Import (unzip) it on the target node and deploy it.
+         *   3. Remove the stack from the source node.
+         * @returns {void}
+         */
+        confirmTransfer() {
+            const target = this.transferTarget;
+            const stackName = this.stack.name;
+            const source = this.endpoint;
+
+            if (!target) {
+                return;
+            }
+
+            this.transferring = true;
+            this.transferStatus = this.$t("transferExporting", "Zipping stack on source node...");
+
+            this.$root.emitAgent(source, "exportStack", stackName, (exportRes) => {
+                if (!exportRes.ok) {
+                    this.transferring = false;
+                    this.$root.toastRes(exportRes);
+                    return;
+                }
+
+                this.transferStatus = this.$t("transferImporting", "Sending and deploying on target node...");
+
+                this.$root.emitAgent(target, "importStack", stackName, exportRes.contentBase64, true, (importRes) => {
+                    if (!importRes.ok) {
+                        this.transferring = false;
+                        this.$root.toastRes(importRes);
+                        return;
+                    }
+
+                    this.transferStatus = this.$t("transferRemovingSource", "Removing stack from source node...");
+
+                    this.$root.emitAgent(source, "deleteStack", stackName, (deleteRes) => {
+                        this.transferring = false;
+                        this.showTransferDialog = false;
+
+                        if (!deleteRes.ok) {
+                            // Import already succeeded; warn but don't treat as full failure.
+                            this.$root.toastError(this.$t("transferSourceRemoveFailed", "Deployed on target, but failed to remove the source stack. Please remove it manually."));
+                        } else {
+                            this.$root.toastSuccess(this.$t("transferDone", "Stack transferred successfully."));
+                        }
+
+                        // Navigate to the stack on its new node.
+                        this.submitted = true;
+                        const newUrl = target ? `/compose/${stackName}/${target}` : `/compose/${stackName}`;
+                        this.$router.push(newUrl);
+                    });
+                });
             });
         },
 

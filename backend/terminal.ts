@@ -17,6 +17,11 @@ export class Terminal {
     protected static terminalMap : Map<string, Terminal> = new Map();
     protected static pendingSocketJoinMap : Map<string, Record<string, DockgeSocket>> = new Map();
 
+    // Maps a terminal name to the stack it belongs to, so socket handlers can
+    // enforce per-stack access control (requireStackAccess) before letting a
+    // client write to / read from / resize a terminal by name.
+    protected static terminalStackMap : Map<string, string> = new Map();
+
     protected _ptyProcess? : pty.IPty;
     protected server : DockgeServer;
     protected buffer : LimitQueue<string> = new LimitQueue(100);
@@ -159,6 +164,7 @@ export class Terminal {
         this.socketList = {};
 
         Terminal.terminalMap.delete(this.name);
+        Terminal.terminalStackMap.delete(this.name);
         log.debug("Terminal", "Terminal " + this.name + " exited with code " + res.exitCode);
 
         clearInterval(this.keepAliveInterval);
@@ -230,6 +236,24 @@ export class Terminal {
         return Terminal.terminalMap.get(name);
     }
 
+    /**
+     * Associate a terminal name with the stack that owns it, for access control.
+     * @param name Terminal name
+     * @param stackName Stack the terminal belongs to
+     */
+    public static setStackOwner(name : string, stackName : string) {
+        Terminal.terminalStackMap.set(name, stackName);
+    }
+
+    /**
+     * Get the stack that owns a terminal, if any.
+     * @param name Terminal name
+     * @returns Stack name or undefined
+     */
+    public static getStackOwner(name : string) : string | undefined {
+        return Terminal.terminalStackMap.get(name);
+    }
+
     public static getOrCreateTerminal(server : DockgeServer, name : string, file : string, args : string | string[], cwd : string) : Terminal {
         // Since exited terminal will be removed from the map, it is safe to get the terminal from the map
         let terminal = Terminal.getTerminal(name);
@@ -247,7 +271,10 @@ export class Terminal {
                 return;
             }
 
-            let terminal = new Terminal(server, terminalName, file, args, cwd);
+            // Use an InteractiveTerminal so the user can answer interactive
+            // prompts (e.g. docker compose "[y/N]" confirmations) or press
+            // Ctrl+C from the progress terminal instead of getting stuck.
+            let terminal = new InteractiveTerminal(server, terminalName, file, args, cwd);
             terminal.rows = PROGRESS_TERMINAL_ROWS;
 
             if (socket) {

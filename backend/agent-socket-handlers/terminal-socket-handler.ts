@@ -8,6 +8,44 @@ import { AgentSocket } from "../../common/agent-socket";
 import { requireAdmin, requireStackAccess } from "../auth";
 
 export class TerminalSocketHandler extends AgentSocketHandler {
+    /**
+     * Enforce access control for a terminal referenced only by name.
+     * Terminal names are predictable (compose-/combined-/container-exec-/console),
+     * so without this check a logged-in user could write to or read from a
+     * terminal belonging to a stack they have no access to.
+     * @param socket Requesting socket
+     * @param terminalName Terminal name supplied by the client
+     */
+    async authorizeTerminalAccess(socket : DockgeSocket, terminalName : string) {
+        // The main interactive console is admin-only.
+        if (terminalName === "console") {
+            await requireAdmin(socket);
+            return;
+        }
+
+        // Prefer the explicit terminal -> stack ownership map.
+        let stackName = Terminal.getStackOwner(terminalName);
+
+        // Fall back to parsing well-known terminal name prefixes. The endpoint
+        // segment always equals this socket's endpoint, so it can be stripped
+        // unambiguously to recover the stack name.
+        if (!stackName) {
+            for (const prefix of [ "compose-", "combined-" ]) {
+                const fullPrefix = `${prefix}${socket.endpoint}-`;
+                if (terminalName.startsWith(fullPrefix)) {
+                    stackName = terminalName.slice(fullPrefix.length);
+                    break;
+                }
+            }
+        }
+
+        if (!stackName) {
+            throw new ValidationError("Terminal not found.");
+        }
+
+        await requireStackAccess(socket, stackName, socket.endpoint);
+    }
+
     create(socket : DockgeSocket, server : DockgeServer, agentSocket : AgentSocket) {
 
         agentSocket.on("terminalInput", async (terminalName : unknown, cmd : unknown, callback) => {
@@ -21,6 +59,8 @@ export class TerminalSocketHandler extends AgentSocketHandler {
                 if (typeof(cmd) !== "string") {
                     throw new Error("Command must be a string.");
                 }
+
+                await this.authorizeTerminalAccess(socket, terminalName);
 
                 let terminal = Terminal.getTerminal(terminalName);
                 if (terminal instanceof InteractiveTerminal) {
@@ -132,6 +172,8 @@ export class TerminalSocketHandler extends AgentSocketHandler {
                     throw new ValidationError("Terminal name must be a string.");
                 }
 
+                await this.authorizeTerminalAccess(socket, terminalName);
+
                 let buffer : string = Terminal.getTerminal(terminalName)?.getBuffer() ?? "";
                 const terminal = Terminal.getTerminal(terminalName);
 
@@ -192,6 +234,8 @@ export class TerminalSocketHandler extends AgentSocketHandler {
                 if (typeof cols !== "number") {
                     throw new Error("Command must be a number.");
                 }
+
+                await this.authorizeTerminalAccess(socket, terminalName);
 
                 let terminal = Terminal.getTerminal(terminalName);
 

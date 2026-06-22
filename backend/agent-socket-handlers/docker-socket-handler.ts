@@ -1,11 +1,12 @@
 import { AgentSocketHandler } from "../agent-socket-handler";
 import { DockgeServer } from "../dockge-server";
-import { callbackError, callbackResult, checkLogin, DockgeSocket, ValidationError } from "../util-server";
+import { callbackError, callbackResult, checkLogin, DockgeSocket, fileExists, ValidationError } from "../util-server";
 import { Stack } from "../stack";
 import { AgentSocket } from "../../common/agent-socket";
 import { requireAdmin, requireStackAccess } from "../auth";
 import { promises as fsAsync } from "fs";
 import path from "path";
+import AdmZip from "adm-zip";
 import { buildAppInstall } from "../app-catalog";
 import { getComposeTerminalName } from "../../common/util-common";
 import { Terminal } from "../terminal";
@@ -111,6 +112,92 @@ export class DockerSocketHandler extends AgentSocketHandler {
                     msgi18n: true,
                 }, callback);
 
+            } catch (e) {
+                callbackError(e, callback);
+            }
+        });
+
+        // Export a Dockge-managed stack folder as a zip (base64) so it can be
+        // transferred to another node.
+        agentSocket.on("exportStack", async (stackName : unknown, callback) => {
+            try {
+                checkLogin(socket);
+                if (typeof(stackName) !== "string") {
+                    throw new ValidationError("Stack name must be a string");
+                }
+                await requireStackAccess(socket, stackName, socket.endpoint);
+
+                const stack = await Stack.getStack(server, stackName);
+                if (!stack.isManagedByDockge) {
+                    throw new ValidationError("Only Dockge-managed stacks can be transferred.");
+                }
+
+                const zip = new AdmZip();
+                zip.addLocalFolder(stack.fullPath);
+
+                callbackResult({
+                    ok: true,
+                    stackName: stack.name,
+                    contentBase64: zip.toBuffer().toString("base64"),
+                }, callback);
+            } catch (e) {
+                callbackError(e, callback);
+            }
+        });
+
+        // Import a stack zip (base64) onto this node, optionally deploying it.
+        // Used as the receiving end of a node-to-node transfer.
+        agentSocket.on("importStack", async (stackName : unknown, contentBase64 : unknown, deploy : unknown, callback) => {
+            try {
+                checkLogin(socket);
+                await requireAdmin(socket);
+
+                if (typeof(stackName) !== "string" || typeof(contentBase64) !== "string") {
+                    throw new ValidationError("Invalid import request");
+                }
+                if (!stackName.match(/^[a-z0-9_-]+$/)) {
+                    throw new ValidationError("Stack name can only contain [a-z][0-9] _ - only");
+                }
+
+                const targetDir = path.join(server.stacksDir, stackName);
+                if (await fileExists(targetDir)) {
+                    throw new ValidationError("A stack with this name already exists on the target node.");
+                }
+
+                const zip = new AdmZip(Buffer.from(contentBase64, "base64"));
+                const root = path.resolve(targetDir);
+                await fsAsync.mkdir(root, { recursive: true });
+
+                // Extract each entry manually with zip-slip protection so a
+                // malicious archive cannot write outside the stack folder.
+                for (const entry of zip.getEntries()) {
+                    const entryPath = path.resolve(root, entry.entryName);
+                    if (entryPath !== root && !entryPath.startsWith(root + path.sep)) {
+                        throw new ValidationError(`Unsafe path in archive: ${entry.entryName}`);
+                    }
+
+                    if (entry.isDirectory) {
+                        await fsAsync.mkdir(entryPath, { recursive: true });
+                    } else {
+                        await fsAsync.mkdir(path.dirname(entryPath), { recursive: true });
+                        await fsAsync.writeFile(entryPath, entry.getData());
+                    }
+                }
+
+                server.sendStackList();
+
+                if (Boolean(deploy)) {
+                    const stack = await Stack.getStack(server, stackName);
+                    await stack.deploy(socket);
+                    server.sendStackList();
+                    stack.joinCombinedTerminal(socket);
+                }
+
+                callbackResult({
+                    ok: true,
+                    msg: "Stack imported.",
+                    stackName,
+                }, callback);
             } catch (e) {
                 callbackError(e, callback);
             }
@@ -578,6 +665,7 @@ export class DockerSocketHandler extends AgentSocketHandler {
 
         agentSocket.on("dockerImageList", async (callback) => {
             try {
+                checkLogin(socket);
                 await requireAdmin(socket);
                 callbackResult({
                     ok: true,
@@ -590,6 +678,7 @@ export class DockerSocketHandler extends AgentSocketHandler {
 
         agentSocket.on("pruneUnusedImages", async (callback) => {
             try {
+                checkLogin(socket);
                 await requireAdmin(socket);
                 await spawnDocker(server, [ "image", "prune", "-a", "-f" ], undefined, {
                     encoding: "utf-8",
@@ -605,6 +694,7 @@ export class DockerSocketHandler extends AgentSocketHandler {
 
         agentSocket.on("removeDockerImage", async (imageID : unknown, callback) => {
             try {
+                checkLogin(socket);
                 await requireAdmin(socket);
                 if (typeof(imageID) !== "string") {
                     throw new ValidationError("Image ID must be a string");
@@ -623,6 +713,7 @@ export class DockerSocketHandler extends AgentSocketHandler {
 
         agentSocket.on("dockerContainerList", async (callback) => {
             try {
+                checkLogin(socket);
                 await requireAdmin(socket);
                 const res = await spawnDocker(server, [ "ps", "-a", "--format", "{{json .}}" ], undefined, {
                     encoding: "utf-8",
@@ -642,6 +733,7 @@ export class DockerSocketHandler extends AgentSocketHandler {
 
         agentSocket.on("dockerContainerAction", async (containerID : unknown, action : unknown, callback) => {
             try {
+                checkLogin(socket);
                 await requireAdmin(socket);
                 if (typeof(containerID) !== "string" || typeof(action) !== "string") {
                     throw new ValidationError("Invalid container action");
@@ -795,7 +887,9 @@ export class DockerSocketHandler extends AgentSocketHandler {
 
                 const containerName = await this.resolveServiceContainer(server, stackName, serviceName, containerID);
                 const normalizedPath = this.normalizeContainerPath(targetPath);
-                const script = "target=\"$1\"; if [ ! -d \"$target\" ]; then echo \"__DOCKGE_NOT_DIR__\"; exit 12; fi; cd \"$target\" || exit 13; for entry in .* *; do if [ \"$entry\" = \".\" ] || [ \"$entry\" = \"..\" ]; then continue; fi; if [ ! -e \"$entry\" ]; then continue; fi; if [ -d \"$entry\" ]; then type=\"dir\"; else type=\"file\"; fi; printf \"%s\\t%s\\n\" \"$type\" \"$entry\"; done";
+                // List entries including hidden files and broken symlinks.
+                // `-e` alone skips dangling symlinks, so also check `-L`.
+                const script = "target=\"$1\"; if [ ! -d \"$target\" ]; then echo \"__DOCKGE_NOT_DIR__\"; exit 12; fi; cd \"$target\" || exit 13; for entry in .* *; do if [ \"$entry\" = \".\" ] || [ \"$entry\" = \"..\" ]; then continue; fi; if [ ! -e \"$entry\" ] && [ ! -L \"$entry\" ]; then continue; fi; if [ -d \"$entry\" ]; then type=\"dir\"; else type=\"file\"; fi; printf \"%s\\t%s\\n\" \"$type\" \"$entry\"; done";
                 const res = await this.execContainerShell(server, containerName, script, [ normalizedPath ]);
                 const stdout = res.stdout?.toString("utf-8") || "";
 
@@ -1006,7 +1100,10 @@ export class DockerSocketHandler extends AgentSocketHandler {
                     ...(options.interactive ? [ "-i" ] : []),
                     containerName,
                     shell,
-                    "-lc",
+                    // Use "-c" (not "-lc"): a login shell can be unsupported by
+                    // busybox sh and may print profile/MOTD banners that corrupt
+                    // the command output, breaking the file listing.
+                    "-c",
                     script,
                     "dockge",
                     ...scriptArgs,
