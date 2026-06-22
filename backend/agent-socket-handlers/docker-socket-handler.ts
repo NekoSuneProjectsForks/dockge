@@ -4,9 +4,84 @@ import { callbackError, callbackResult, checkLogin, DockgeSocket, fileExists, Va
 import { Stack } from "../stack";
 import { AgentSocket } from "../../common/agent-socket";
 import { requireAdmin, requireStackAccess } from "../auth";
-import { promises as fsAsync } from "fs";
+import { promises as fsAsync, createWriteStream } from "fs";
 import path from "path";
-import AdmZip from "adm-zip";
+import os from "os";
+import crypto from "crypto";
+import archiver from "archiver";
+import extract from "extract-zip";
+
+// Chunk size for streamed node-to-node transfers. Small enough to stay well
+// under socket.io's maxHttpBufferSize even after base64 expansion, large
+// enough to keep the number of round-trips reasonable for multi-GB stacks.
+const TRANSFER_CHUNK_SIZE = 16 * 1024 * 1024;
+
+interface TransferState {
+    type: "export" | "import";
+    zipPath: string;
+    stackName: string;
+    size: number;
+    received?: number;
+    writeStream?: ReturnType<typeof createWriteStream>;
+    createdAt: number;
+}
+
+// Active transfers keyed by a client-generated transfer id. Per-node (each
+// Dockge instance keeps its own map for the side of the transfer it handles).
+const activeTransfers = new Map<string, TransferState>();
+
+function transferTmpDir() {
+    return path.join(os.tmpdir(), "dockge-transfers");
+}
+
+// Best-effort cleanup of transfers that were abandoned (browser closed, etc.).
+function reapStaleTransfers() {
+    const now = Date.now();
+    for (const [ id, state ] of activeTransfers) {
+        if (now - state.createdAt > 6 * 60 * 60 * 1000) {
+            try {
+                state.writeStream?.destroy();
+            } catch (e) {
+                // ignore
+            }
+            fsAsync.rm(state.zipPath, { force: true }).catch(() => {});
+            activeTransfers.delete(id);
+        }
+    }
+}
+
+/**
+ * Stream a directory into a zip file on disk, reporting progress.
+ * @param sourceDir Directory to archive
+ * @param zipPath Destination zip file path
+ * @param onProgress Called with a 0-100 percentage as the archive is written
+ */
+function zipDirectory(sourceDir: string, zipPath: string, onProgress: (percent: number) => void): Promise<number> {
+    return new Promise((resolve, reject) => {
+        const output = createWriteStream(zipPath);
+        const archive = archiver("zip", { zlib: { level: 6 } });
+
+        output.on("close", () => resolve(archive.pointer()));
+        output.on("error", reject);
+        archive.on("error", reject);
+        archive.on("warning", (err) => {
+            if (err.code !== "ENOENT") {
+                reject(err);
+            }
+        });
+        archive.on("progress", (data) => {
+            const total = data.fs.totalBytes || 0;
+            const processed = data.fs.processedBytes || 0;
+            if (total > 0) {
+                onProgress(Math.min(99, Math.floor((processed / total) * 100)));
+            }
+        });
+
+        archive.pipe(output);
+        archive.directory(sourceDir, false);
+        archive.finalize();
+    });
+}
 import { buildAppInstall } from "../app-catalog";
 import { getComposeTerminalName } from "../../common/util-common";
 import { Terminal } from "../terminal";
@@ -117,13 +192,18 @@ export class DockerSocketHandler extends AgentSocketHandler {
             }
         });
 
-        // Export a Dockge-managed stack folder as a zip (base64) so it can be
-        // transferred to another node.
-        agentSocket.on("exportStack", async (stackName : unknown, callback) => {
+        // ===== Node-to-node stack transfer (streamed + chunked) =====
+        // The stack is zipped to a temp file on the source, streamed in chunks
+        // (so multi-GB stacks never exceed the socket buffer or RAM), then
+        // stream-extracted and deployed on the target. Progress for each stage
+        // (zip / transfer / unzip / deploy) is pushed via "transferProgress".
+
+        // Source: zip the stack to a temp file and report how to fetch it.
+        agentSocket.on("transferExportBegin", async (stackName : unknown, transferId : unknown, callback) => {
             try {
                 checkLogin(socket);
-                if (typeof(stackName) !== "string") {
-                    throw new ValidationError("Stack name must be a string");
+                if (typeof(stackName) !== "string" || typeof(transferId) !== "string") {
+                    throw new ValidationError("Invalid transfer request");
                 }
                 await requireStackAccess(socket, stackName, socket.endpoint);
 
@@ -132,31 +212,99 @@ export class DockerSocketHandler extends AgentSocketHandler {
                     throw new ValidationError("Only Dockge-managed stacks can be transferred.");
                 }
 
-                const zip = new AdmZip();
-                zip.addLocalFolder(stack.fullPath);
+                reapStaleTransfers();
+                await fsAsync.mkdir(transferTmpDir(), { recursive: true });
+                const zipPath = path.join(transferTmpDir(), `${transferId}.zip`);
+
+                socket.emitAgent("transferProgress", { transferId, stage: "zip", percent: 0 });
+                const size = await zipDirectory(stack.fullPath, zipPath, (percent) => {
+                    socket.emitAgent("transferProgress", { transferId, stage: "zip", percent });
+                });
+                socket.emitAgent("transferProgress", { transferId, stage: "zip", percent: 100 });
+
+                const totalChunks = Math.max(1, Math.ceil(size / TRANSFER_CHUNK_SIZE));
+                activeTransfers.set(transferId, {
+                    type: "export",
+                    zipPath,
+                    stackName,
+                    size,
+                    createdAt: Date.now(),
+                });
 
                 callbackResult({
                     ok: true,
-                    stackName: stack.name,
-                    contentBase64: zip.toBuffer().toString("base64"),
+                    transferId,
+                    size,
+                    totalChunks,
+                    chunkSize: TRANSFER_CHUNK_SIZE,
                 }, callback);
             } catch (e) {
                 callbackError(e, callback);
             }
         });
 
-        // Import a stack zip (base64) onto this node, optionally deploying it.
-        // Used as the receiving end of a node-to-node transfer.
-        agentSocket.on("importStack", async (stackName : unknown, contentBase64 : unknown, deploy : unknown, callback) => {
+        // Source: return one chunk of the zip as base64.
+        agentSocket.on("transferExportChunk", async (transferId : unknown, chunkIndex : unknown, callback) => {
+            try {
+                checkLogin(socket);
+                if (typeof(transferId) !== "string" || typeof(chunkIndex) !== "number") {
+                    throw new ValidationError("Invalid transfer chunk request");
+                }
+                const state = activeTransfers.get(transferId);
+                if (!state || state.type !== "export") {
+                    throw new ValidationError("Transfer not found or expired.");
+                }
+
+                const fh = await fsAsync.open(state.zipPath, "r");
+                try {
+                    const buffer = Buffer.alloc(TRANSFER_CHUNK_SIZE);
+                    const { bytesRead } = await fh.read(buffer, 0, TRANSFER_CHUNK_SIZE, chunkIndex * TRANSFER_CHUNK_SIZE);
+                    callbackResult({
+                        ok: true,
+                        dataBase64: buffer.subarray(0, bytesRead).toString("base64"),
+                        bytesRead,
+                    }, callback);
+                } finally {
+                    await fh.close();
+                }
+            } catch (e) {
+                callbackError(e, callback);
+            }
+        });
+
+        // Source: delete the temp zip once the transfer is done (or aborted).
+        agentSocket.on("transferExportEnd", async (transferId : unknown, callback) => {
+            try {
+                checkLogin(socket);
+                if (typeof(transferId) !== "string") {
+                    throw new ValidationError("Invalid transfer request");
+                }
+                const state = activeTransfers.get(transferId);
+                if (state) {
+                    await fsAsync.rm(state.zipPath, { force: true });
+                    activeTransfers.delete(transferId);
+                }
+                callbackResult({ ok: true }, callback);
+            } catch (e) {
+                callbackError(e, callback);
+            }
+        });
+
+        // Target: prepare to receive a streamed zip.
+        agentSocket.on("transferImportBegin", async (stackName : unknown, size : unknown, transferId : unknown, callback) => {
             try {
                 checkLogin(socket);
                 await requireAdmin(socket);
 
-                if (typeof(stackName) !== "string" || typeof(contentBase64) !== "string") {
+                if (typeof(stackName) !== "string" || typeof(transferId) !== "string") {
                     throw new ValidationError("Invalid import request");
                 }
                 if (!stackName.match(/^[a-z0-9_-]+$/)) {
                     throw new ValidationError("Stack name can only contain [a-z][0-9] _ - only");
+                }
+                const totalSize = Number(size);
+                if (!Number.isFinite(totalSize) || totalSize < 0) {
+                    throw new ValidationError("Invalid transfer size");
                 }
 
                 const targetDir = path.join(server.stacksDir, stackName);
@@ -164,48 +312,121 @@ export class DockerSocketHandler extends AgentSocketHandler {
                     throw new ValidationError("A stack with this name already exists on the target node.");
                 }
 
-                const zip = new AdmZip(Buffer.from(contentBase64, "base64"));
-                const root = path.resolve(targetDir);
-                await fsAsync.mkdir(root, { recursive: true });
+                reapStaleTransfers();
+                await fsAsync.mkdir(transferTmpDir(), { recursive: true });
+                const zipPath = path.join(transferTmpDir(), `${transferId}.zip`);
 
-                // Extract each entry manually with zip-slip protection so a
-                // malicious archive cannot write outside the stack folder.
-                for (const entry of zip.getEntries()) {
-                    const entryPath = path.resolve(root, entry.entryName);
-                    if (entryPath !== root && !entryPath.startsWith(root + path.sep)) {
-                        throw new ValidationError(`Unsafe path in archive: ${entry.entryName}`);
-                    }
+                activeTransfers.set(transferId, {
+                    type: "import",
+                    zipPath,
+                    stackName,
+                    size: totalSize,
+                    received: 0,
+                    writeStream: createWriteStream(zipPath),
+                    createdAt: Date.now(),
+                });
 
-                    if (entry.isDirectory) {
-                        await fsAsync.mkdir(entryPath, { recursive: true });
-                    } else {
-                        await fsAsync.mkdir(path.dirname(entryPath), { recursive: true });
-                        await fsAsync.writeFile(entryPath, entry.getData());
-                    }
+                callbackResult({
+                    ok: true,
+                    transferId,
+                    chunkSize: TRANSFER_CHUNK_SIZE,
+                }, callback);
+            } catch (e) {
+                callbackError(e, callback);
+            }
+        });
+
+        // Target: append a chunk to the temp zip and report transfer progress.
+        agentSocket.on("transferImportChunk", async (transferId : unknown, dataBase64 : unknown, callback) => {
+            try {
+                checkLogin(socket);
+                if (typeof(transferId) !== "string" || typeof(dataBase64) !== "string") {
+                    throw new ValidationError("Invalid transfer chunk");
+                }
+                const state = activeTransfers.get(transferId);
+                if (!state || state.type !== "import" || !state.writeStream) {
+                    throw new ValidationError("Transfer not found or expired.");
+                }
+
+                const buffer = Buffer.from(dataBase64, "base64");
+                await new Promise<void>((resolve, reject) => {
+                    state.writeStream!.write(buffer, (err) => (err ? reject(err) : resolve()));
+                });
+                state.received = (state.received || 0) + buffer.length;
+
+                const percent = state.size > 0
+                    ? Math.min(99, Math.floor((state.received / state.size) * 100))
+                    : 0;
+                socket.emitAgent("transferProgress", { transferId, stage: "transfer", percent });
+
+                callbackResult({ ok: true, received: state.received }, callback);
+            } catch (e) {
+                callbackError(e, callback);
+            }
+        });
+
+        // Target: finalize - extract the zip and optionally deploy.
+        agentSocket.on("transferImportEnd", async (transferId : unknown, deploy : unknown, callback) => {
+            try {
+                checkLogin(socket);
+                await requireAdmin(socket);
+                if (typeof(transferId) !== "string") {
+                    throw new ValidationError("Invalid transfer request");
+                }
+                const state = activeTransfers.get(transferId);
+                if (!state || state.type !== "import" || !state.writeStream) {
+                    throw new ValidationError("Transfer not found or expired.");
+                }
+
+                // Flush and close the temp zip file.
+                await new Promise<void>((resolve) => state.writeStream!.end(() => resolve()));
+
+                const targetDir = path.resolve(path.join(server.stacksDir, state.stackName));
+
+                try {
+                    // extract-zip streams entries and rejects path-traversal
+                    // ("zip slip") entries, so extraction stays inside targetDir.
+                    let processed = 0;
+                    await extract(state.zipPath, {
+                        dir: targetDir,
+                        onEntry: (entry, zipfile) => {
+                            processed += 1;
+                            const total = zipfile.entryCount || 0;
+                            const percent = total > 0 ? Math.min(99, Math.floor((processed / total) * 100)) : 0;
+                            socket.emitAgent("transferProgress", { transferId, stage: "unzip", percent });
+                        },
+                    });
+                    socket.emitAgent("transferProgress", { transferId, stage: "unzip", percent: 100 });
+                } catch (extractError) {
+                    await fsAsync.rm(targetDir, { recursive: true, force: true });
+                    throw extractError;
+                } finally {
+                    await fsAsync.rm(state.zipPath, { force: true });
+                    activeTransfers.delete(transferId);
                 }
 
                 server.sendStackList();
 
                 if (Boolean(deploy)) {
+                    socket.emitAgent("transferProgress", { transferId, stage: "deploy", percent: 0 });
                     try {
-                        const stack = await Stack.getStack(server, stackName);
+                        const stack = await Stack.getStack(server, state.stackName);
                         await stack.deploy(socket);
                         server.sendStackList();
                         stack.joinCombinedTerminal(socket);
                     } catch (deployError) {
-                        // Roll back the freshly imported files so a failed
-                        // transfer doesn't leave a duplicate copy on this node.
-                        // The source stack is kept whenever the import fails.
-                        await fsAsync.rm(root, { recursive: true, force: true });
+                        // Roll back so a failed transfer leaves no duplicate.
+                        await fsAsync.rm(targetDir, { recursive: true, force: true });
                         server.sendStackList();
                         throw deployError;
                     }
                 }
 
+                socket.emitAgent("transferProgress", { transferId, stage: "done", percent: 100 });
                 callbackResult({
                     ok: true,
                     msg: "Stack imported.",
-                    stackName,
+                    stackName: state.stackName,
                 }, callback);
             } catch (e) {
                 callbackError(e, callback);

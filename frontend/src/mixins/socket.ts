@@ -50,6 +50,9 @@ export default defineComponent({
             },
 
             updateAllProgressMap: {} as Record<string, object>,
+
+            // Node-to-node transfer progress, keyed by client transfer id
+            transferProgressMap: {} as Record<string, object>,
         };
     },
     computed: {
@@ -308,6 +311,12 @@ export default defineComponent({
                 if (res && typeof res === "object") {
                     const endpoint = typeof res.endpoint === "string" ? res.endpoint : "";
                     this.updateAllProgressMap[endpoint] = res;
+                }
+            });
+
+            agentSocket.on("transferProgress", (res) => {
+                if (res && typeof res === "object" && typeof res.transferId === "string") {
+                    this.transferProgressMap[res.transferId] = res;
                 }
             });
 

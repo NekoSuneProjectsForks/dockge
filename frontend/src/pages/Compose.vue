@@ -264,9 +264,27 @@
                     </option>
                 </select>
 
-                <div v-if="transferring" class="mt-3 text-muted">
-                    <font-awesome-icon icon="spinner" spin class="me-1" />
-                    {{ transferStatus }}
+                <div v-if="transferring" class="mt-3">
+                    <div class="d-flex justify-content-between small text-muted mb-1">
+                        <span>
+                            <font-awesome-icon icon="spinner" spin class="me-1" />
+                            {{ transferStageLabel }}
+                        </span>
+                        <span>{{ transferPercent }}%</span>
+                    </div>
+                    <div class="progress" style="height: 18px;">
+                        <div
+                            class="progress-bar progress-bar-striped progress-bar-animated"
+                            role="progressbar"
+                            :style="{ width: transferPercent + '%' }"
+                            :aria-valuenow="transferPercent"
+                            aria-valuemin="0"
+                            aria-valuemax="100"
+                        ></div>
+                    </div>
+                    <div class="small text-muted mt-1">
+                        {{ $t("transferKeepOpen", "Keep this page open until the transfer finishes.") }}
+                    </div>
                 </div>
             </BModal>
         </div>
@@ -371,7 +389,7 @@ export default {
             showTransferDialog: false,
             transferTarget: null,
             transferring: false,
-            transferStatus: "",
+            activeTransferId: null,
             newContainerName: "",
             stopServiceStatusTimeout: false,
         };
@@ -394,6 +412,32 @@ export default {
                 .filter(endpoint => endpoint !== ""
                     && endpoint !== this.endpoint
                     && this.$root.agentStatusList[endpoint] === "online");
+        },
+
+        /**
+         * Live progress for the active transfer, pushed by the server.
+         * @returns {object|null} { stage, percent } or null
+         */
+        transferProgress() {
+            if (!this.activeTransferId) {
+                return null;
+            }
+            return this.$root.transferProgressMap[this.activeTransferId] || null;
+        },
+
+        transferPercent() {
+            return Math.round(this.transferProgress?.percent || 0);
+        },
+
+        transferStageLabel() {
+            const labels = {
+                zip: this.$t("transferStageZip", "Zipping on source node..."),
+                transfer: this.$t("transferStageTransfer", "Transferring..."),
+                unzip: this.$t("transferStageUnzip", "Unzipping on target node..."),
+                deploy: this.$t("transferStageDeploy", "Deploying on target node..."),
+                done: this.$t("transferStageDone", "Finishing up..."),
+            };
+            return labels[this.transferProgress?.stage] || this.$t("transferStagePreparing", "Preparing...");
         },
 
         urls() {
@@ -751,66 +795,114 @@ export default {
             // Note: the local/current node's endpoint is "" (empty string), so
             // use null - not a falsy check - to represent "nothing selected".
             this.transferTarget = this.transferTargets.length > 0 ? this.transferTargets[0] : null;
-            this.transferStatus = "";
+            this.activeTransferId = null;
             this.showTransferDialog = true;
         },
 
         /**
-         * Move this stack to another node:
-         *   1. Export (zip) the stack folder from the source node.
-         *   2. Import (unzip) it on the target node and deploy it.
-         *   3. Remove the stack from the source node.
-         * @returns {void}
+         * Generate a unique id for a transfer operation.
+         * @returns {string} Unique transfer id
          */
-        confirmTransfer() {
+        generateTransferId() {
+            if (window.crypto && window.crypto.randomUUID) {
+                return window.crypto.randomUUID();
+            }
+            return `t-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        },
+
+        /**
+         * Promise wrapper around emitAgent's callback-style API.
+         * @param {string} endpoint Target endpoint
+         * @param {string} eventName Event name
+         * @param {...any} args Event arguments
+         * @returns {Promise<object>} The server response
+         */
+        emitAgentAsync(endpoint, eventName, ...args) {
+            return new Promise((resolve) => {
+                this.$root.emitAgent(endpoint, eventName, ...args, (res) => {
+                    resolve(res || { ok: false });
+                });
+            });
+        },
+
+        /**
+         * Move this stack to another node, streaming it in chunks so multi-GB
+         * stacks transfer without hitting the socket buffer limit:
+         *   1. Zip the stack to a temp file on the source (zip progress).
+         *   2. Stream the zip in chunks to the target (transfer progress).
+         *   3. Unzip + deploy on the target (unzip/deploy progress).
+         *   4. Remove the stack from the source (move).
+         * @returns {Promise<void>}
+         */
+        async confirmTransfer() {
             const target = this.transferTarget;
             const stackName = this.stack.name;
             const source = this.endpoint;
 
             // target can legitimately be "" (the local node), so compare to null.
-            if (target === null) {
+            if (target === null || this.transferring) {
                 return;
             }
 
+            const transferId = this.generateTransferId();
+            this.activeTransferId = transferId;
             this.transferring = true;
-            this.transferStatus = this.$t("transferExporting", "Zipping stack on source node...");
 
-            this.$root.emitAgent(source, "exportStack", stackName, (exportRes) => {
-                if (!exportRes.ok) {
-                    this.transferring = false;
-                    this.$root.toastRes(exportRes);
-                    return;
+            try {
+                // 1. Zip on the source node.
+                const begin = await this.emitAgentAsync(source, "transferExportBegin", stackName, transferId);
+                if (!begin.ok) {
+                    throw begin;
+                }
+                const totalChunks = begin.totalChunks || 1;
+
+                // 2. Prepare the target to receive.
+                const importBegin = await this.emitAgentAsync(target, "transferImportBegin", stackName, begin.size, transferId);
+                if (!importBegin.ok) {
+                    throw importBegin;
                 }
 
-                this.transferStatus = this.$t("transferImporting", "Sending and deploying on target node...");
-
-                this.$root.emitAgent(target, "importStack", stackName, exportRes.contentBase64, true, (importRes) => {
-                    if (!importRes.ok) {
-                        this.transferring = false;
-                        this.$root.toastRes(importRes);
-                        return;
+                // 3. Stream the zip chunk by chunk: source -> browser -> target.
+                for (let i = 0; i < totalChunks; i++) {
+                    const chunk = await this.emitAgentAsync(source, "transferExportChunk", transferId, i);
+                    if (!chunk.ok) {
+                        throw chunk;
                     }
+                    const imported = await this.emitAgentAsync(target, "transferImportChunk", transferId, chunk.dataBase64);
+                    if (!imported.ok) {
+                        throw imported;
+                    }
+                }
 
-                    this.transferStatus = this.$t("transferRemovingSource", "Removing stack from source node...");
+                // 4. Unzip + deploy on the target.
+                const end = await this.emitAgentAsync(target, "transferImportEnd", transferId, true);
+                if (!end.ok) {
+                    throw end;
+                }
 
-                    this.$root.emitAgent(source, "deleteStack", stackName, (deleteRes) => {
-                        this.transferring = false;
-                        this.showTransferDialog = false;
+                // 5. Clean up the source temp zip.
+                await this.emitAgentAsync(source, "transferExportEnd", transferId);
 
-                        if (!deleteRes.ok) {
-                            // Import already succeeded; warn but don't treat as full failure.
-                            this.$root.toastError(this.$t("transferSourceRemoveFailed", "Deployed on target, but failed to remove the source stack. Please remove it manually."));
-                        } else {
-                            this.$root.toastSuccess(this.$t("transferDone", "Stack transferred successfully."));
-                        }
+                // 6. Move: remove the stack from the source node.
+                const del = await this.emitAgentAsync(source, "deleteStack", stackName);
 
-                        // Navigate to the stack on its new node.
-                        this.submitted = true;
-                        const newUrl = target ? `/compose/${stackName}/${target}` : `/compose/${stackName}`;
-                        this.$router.push(newUrl);
-                    });
-                });
-            });
+                this.transferring = false;
+                this.showTransferDialog = false;
+
+                if (!del.ok) {
+                    this.$root.toastError(this.$t("transferSourceRemoveFailed", "Deployed on target, but failed to remove the source stack. Please remove it manually."));
+                } else {
+                    this.$root.toastSuccess(this.$t("transferDone", "Stack transferred successfully."));
+                }
+
+                this.submitted = true;
+                this.$router.push(target ? `/compose/${stackName}/${target}` : `/compose/${stackName}`);
+            } catch (err) {
+                this.transferring = false;
+                // Best-effort cleanup of the source temp zip so it isn't orphaned.
+                this.emitAgentAsync(source, "transferExportEnd", transferId).catch(() => {});
+                this.$root.toastRes(err && err.msg ? err : { ok: false, msg: this.$t("transferFailed", "Transfer failed.") });
+            }
         },
 
         cancelStackOperation() {
