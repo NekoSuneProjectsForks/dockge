@@ -65,7 +65,7 @@ jobs:
       - name: Compute image tags
         id: tags
         run: |
-          TAGS="ghcr.io/nekosuneprojects/dockge:nightly"
+          TAGS="ghcr.io/nekosuneprojectsforks/dockge:nightly"
           if [ -n "${DOCKERHUB_USERNAME}" ] && [ -n "${DOCKERHUB_TOKEN}" ]; then
             TAGS="${TAGS},chisdealhdyt/dockge:nightly"
           else
