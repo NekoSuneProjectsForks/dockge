@@ -15,6 +15,11 @@ jobs:
     permissions:
       contents: read
       packages: write
+    env:
+      # Exposed so steps can detect whether Docker Hub credentials are
+      # configured for this repository (forks usually don't have them).
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
 
     steps:
       - uses: actions/checkout@v4
@@ -27,18 +32,22 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Only attempt the Docker Hub login when both secrets are present,
+      # otherwise docker/login-action fails the whole job with
+      # "Username and password required".
       - name: Login to Docker Hub
+        if: ${{ env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' }}
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN  }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Use Node.js 22
         uses: actions/setup-node@v4
@@ -48,5 +57,28 @@ jobs:
       - name: Install dependencies
         run: npm clean-install --no-fund
 
-      - name: Run release-nightly
-        run: npm run release-nightly
+      - name: Build frontend
+        run: npm run build:frontend
+
+      # Always publish to GHCR (uses the automatic GITHUB_TOKEN). Add the
+      # Docker Hub tag only when Docker Hub credentials are configured.
+      - name: Compute image tags
+        id: tags
+        run: |
+          TAGS="ghcr.io/nekosuneprojects/dockge:nightly"
+          if [ -n "${DOCKERHUB_USERNAME}" ] && [ -n "${DOCKERHUB_TOKEN}" ]; then
+            TAGS="${TAGS},chisdealhdyt/dockge:nightly"
+          else
+            echo "::notice::DOCKERHUB_USERNAME/DOCKERHUB_TOKEN not set - skipping Docker Hub push, publishing to GHCR only."
+          fi
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push nightly image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          target: nightly
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
